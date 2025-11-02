@@ -33,6 +33,14 @@ local SAVE_MAX_WAIT = 60
 
 local InkAwayView = {}
 
+-- The idle wait is the "Autosave" setting (inkaway_autosave_idle): seconds, or 0
+-- for no timed saves (closing, sleeping and leaving a document still save).
+function InkAwayView:autosaveIdle()
+    local v = self.autosave_idle
+    if v == nil then v = SAVE_IDLE end
+    return v
+end
+
 ------------------------------------------------------------------------------
 -- The document and its state
 ------------------------------------------------------------------------------
@@ -127,9 +135,10 @@ end
 
 -- Schedule the save check, unless one is already waiting.
 function InkAwayView:wakeAutosave()
-    if self._autosave_pending or self.closing then return end
+    local idle = self:autosaveIdle()
+    if idle <= 0 or self._autosave_pending or self.closing then return end
     self._autosave_pending = true
-    UIManager:scheduleIn(SAVE_IDLE, self._autosave_tick)
+    UIManager:scheduleIn(idle, self._autosave_tick)
 end
 
 -- Save once the document has been left alone for a moment. Never while a stroke
@@ -145,17 +154,133 @@ function InkAwayView:autosaveTick()
         or self.editing_text or self._export_job
     local active = self.canvas.rev ~= self._tick_rev
     self._tick_rev = self.canvas.rev
-    self._save_waited = (self._save_waited or 0) + SAVE_IDLE
-    if not busy and (not active or self._save_waited >= SAVE_MAX_WAIT) then
-        self:saveDocument()
+    local idle = self:autosaveIdle()
+    self._save_waited = (self._save_waited or 0) + idle
+    if not busy and (not active or self._save_waited >= math.max(SAVE_MAX_WAIT, idle * 4)) then
+        -- the timed save runs in a forked process so the pen never waits for it;
+        -- anything it cannot do that way (a new file, a failure) is saved here
+        if not self:saveDocumentBackground() then self:saveDocument() end
     end
-    if self:docChanged() then self:wakeAutosave() end
+    if idle > 0 and self:docChanged() then self:wakeAutosave() end
+end
+
+------------------------------------------------------------------------------
+-- Saving in the background
+--
+-- Serializing a big drawing and syncing the file blocks KOReader's one thread
+-- for as long as it takes, and the pen freezes with it. The timed autosave
+-- therefore forks (KOReader's runInSubProcess, as the update check and OCR do):
+-- the child holds a copy-on-write snapshot of the document, writes the file and
+-- reports "ok" in a small status file; this side only polls for it. Saves made
+-- when the document is left, closed or put to sleep stay in the foreground, and
+-- wait for a background save still running (one writer per file).
+------------------------------------------------------------------------------
+
+local BG_POLL = 0.5          -- seconds between looks at the background save
+local BG_DEADLINE = 120      -- a background save still running after this is stopped
+
+local function subprocessUtil()
+    local ok, util = pcall(require, "ffi/util")
+    if ok and util and util.runInSubProcess and util.isSubProcessDone then return util end
+end
+
+-- Only plain documents that already have their file and use this save (the
+-- reader's and the notes view's saves are different) are saved in the background.
+function InkAwayView:bgSaveAllowed()
+    return self.doc_written and self.doc_path and self.canvas
+        and rawequal(self.saveDocument, InkAwayView.saveDocument) and true or false
+end
+
+-- Start a background save of the open document. Returns true when a save is
+-- running or nothing needed saving, false when the caller should save normally.
+function InkAwayView:saveDocumentBackground()
+    if self._bg_save then return true end            -- one at a time
+    if self._bg_failed or not self:bgSaveAllowed() then return false end
+    local util = subprocessUtil()
+    if not util then return false end
+    if self.notebook then self:nbSyncOut() end
+    if not self:docChanged() then return true end
+
+    local path, canvas, nb = self.doc_path, self.canvas, self.notebook
+    local rev = canvas.rev
+    local extra
+    if nb then
+        extra = { export = self.export_opts }
+    else
+        extra = { bg = self.bg_path, export = self.export_opts, paper = self.paper,
+            layers = self:layersForFile() }
+    end
+    local cache = self._page_cache
+    local status = path .. ".status"
+    os.remove(status)
+    local pid = util.runInSubProcess(function()
+        local ok, res, err = pcall(function()
+            if nb then return Project.saveNotebook(nb, path, cache, extra) end
+            return Project.save(canvas, path, extra)
+        end)
+        local msg = (ok and res) and "ok" or tostring(ok and err or res)
+        local f = io.open(status .. ".part", "wb")
+        if f then
+            f:write(msg)
+            f:close()
+            os.rename(status .. ".part", status)
+        end
+    end, false, false)
+    if type(pid) ~= "number" or pid <= 0 then return false end
+
+    -- Count it as saved now; a failure marks the document changed again
+    self.dirty = false
+    self._page_rev = rev
+    self._save_waited = 0
+    self._bg_save = { pid = pid, path = path, canvas = canvas, status = status, started = os.time() }
+    self._bg_save_poll = self._bg_save_poll or function() self:bgSavePoll() end
+    UIManager:scheduleIn(BG_POLL, self._bg_save_poll)
+    return true
+end
+
+function InkAwayView:bgSavePoll()
+    local job = self._bg_save
+    if not job then return end
+    if self:finishBgSave(false) then
+        if not self.closing and self:docChanged() then self:wakeAutosave() end   -- more came in meanwhile
+        return
+    end
+    if not job.killed and os.time() - job.started >= BG_DEADLINE then
+        job.killed = true
+        local util = subprocessUtil()
+        if util and util.terminateSubProcess then util.terminateSubProcess(job.pid) end
+    end
+    UIManager:scheduleIn(BG_POLL, self._bg_save_poll)
+end
+
+-- Collect the background save: with `block`, wait for the child. Returns true
+-- once it is collected (and its result dealt with), false while it still runs.
+function InkAwayView:finishBgSave(block)
+    local job = self._bg_save
+    if not job then return true end
+    local util = subprocessUtil()
+    if util and not util.isSubProcessDone(job.pid, block and true or false) then return false end
+    if self._bg_save_poll then UIManager:unschedule(self._bg_save_poll) end
+    self._bg_save = nil
+    local f = io.open(job.status, "rb")
+    local res = f and f:read("*a")
+    if f then f:close() end
+    os.remove(job.status)
+    os.remove(job.status .. ".part")
+    if res ~= "ok" then
+        logger.warn("InkAway: background save failed:", job.path, res)
+        os.remove(job.path .. ".tmp")
+        self._bg_failed = true            -- the next save is made here, and reports a problem
+        if self.canvas == job.canvas and self.doc_path == job.path then self.dirty = true end
+    end
+    return true
 end
 
 -- Save the open document if it changed, or always with `force`. A document with
 -- nothing in it gets no file until it has something, so an untouched new one
 -- leaves nothing behind. Returns false only when the write failed.
 function InkAwayView:saveDocument(force)
+    if self._bg_save then self:finishBgSave(true) end   -- never two writers on one file
     if not self.doc_path then return true end
     if self.notebook then self:nbSyncOut() end
     if not (force or self:docChanged()) then return true end
@@ -181,6 +306,7 @@ function InkAwayView:saveDocument(force)
         return false
     end
     self._save_failed = nil
+    self._bg_failed = nil
     if not self.doc_written then   -- a new document joins the end of its folder's tabs
         Folder.update(Storage.dirName(path), function(d) Folder.add(d, Storage.baseName(path)) end)
     end

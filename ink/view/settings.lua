@@ -380,6 +380,18 @@ function InkAwayView:openSettings()
         add(vspan(4))
         add(self:sheetHint(_("Fast strokes leave faint marks; a full refresh clears them this often."), content_w))
         add(vspan(10))
+        -- autosave: how long the pen must rest before the document is written
+        add(self:sheetLabel(_("Autosave"), true))
+        add(vspan(6))
+        add(self:segmentedRow({ { 0, _("Off") }, { 8, _("8 s") }, { 30, _("30 s") }, { 120, _("2 min") },
+                { 300, _("5 min") } }, self.autosave_idle, content_w,
+            function(v) self.autosave_idle = v; self:setSetting("inkaway_autosave_idle", v)
+                if v > 0 then self:wakeAutosave() end
+                self:openSettings() end))
+        add(vspan(4))
+        add(self:sheetHint(_("Saving can pause the pen for a moment. Off still saves when you close or leave."), content_w))
+        add(vspan(16))
+
         -- one full refresh now, as the "Refresh the screen" gesture does
         add(act(_("Refresh the screen"), content_w, function() self:refreshScreen() end, nil, "refresh"))
         add(vspan(16))

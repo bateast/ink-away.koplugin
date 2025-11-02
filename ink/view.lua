@@ -210,6 +210,7 @@ function InkAwayView:init()
     self.symmetry    = self:getSetting("inkaway_symmetry", "off")      -- off | vert | horiz | quad
     self.fab_side    = self:getSetting("inkaway_fab_side", "right")   -- zoom and Pan buttons: right | left | hidden
     self.ghost_clean = self:getSetting("inkaway_ghost", 0)             -- full refresh every this many strokes (0 = off)
+    self.autosave_idle = self:getSetting("inkaway_autosave_idle", 8)   -- seconds of rest before a save; 0 = only on close/sleep
     self.erase_bg    = self:getSetting("inkaway_erase_bg", false)      -- the eraser also removes pictures
     self.erase_whole = self:getSetting("inkaway_erase_whole", false)   -- the eraser removes whole strokes
     self.eraser_outline = self:getSetting("inkaway_eraser_outline", false)   -- a ring under the pen while erasing
